@@ -1,151 +1,170 @@
 import streamlit as st
 import pandas as pd
-import math
-from pathlib import Path
+import plotly.express as px
+import plotly.graph_objects as go
+import firebase_admin
+from firebase_admin import credentials, firestore
+import json
+from datetime import datetime
 
-# Set the title and favicon that appear in the Browser's tab bar.
+# Configuración de la página
 st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
+    page_title="QR Performance Dashboard",
+    page_icon="⚡",
+    layout="wide"
 )
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+# Inicialización de Firebase usando secrets
+@st.cache_resource
+def init_firebase():
+    if not firebase_admin._apps:
+        # Convertir los secrets a un diccionario y usarlo directamente
+        key_dict = dict(st.secrets["firebase"])
+        # Asegurarse de que el private_key sea una string
+        if isinstance(key_dict.get('private_key'), str):
+            key_dict['private_key'] = key_dict['private_key'].replace('\\n', '\n')
+        try:
+            cred = credentials.Certificate(key_dict)
+            firebase_admin.initialize_app(cred)
+        except Exception as e:
+            st.error(f"Error inicializando Firebase: {str(e)}")
+            return None
+    return firestore.client()
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+# Obtención de datos
+@st.cache_data(ttl=300)
+def get_data():
+    try:
+        db = init_firebase()
+        if db is None:
+            return pd.DataFrame()
+            
+        qr_times_ref = db.collection('AnalyticsBusinessQuestions/sprint2/businessQuestionQR')
+        docs = qr_times_ref.stream()
+        
+        data = []
+        for doc in docs:
+            doc_data = doc.to_dict()
+            data.append({
+                'user_id': doc_data.get('userId', 'unknown'),
+                'render_time': doc_data.get('qr_rtime', 0),
+                'timestamp': doc_data.get('timestamp', datetime.now())
+            })
+        
+        return pd.DataFrame(data)
+    except Exception as e:
+        st.error(f"Error al obtener datos: {str(e)}")
+        return pd.DataFrame()
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+# Interfaz de usuario
+st.title("⚡ QR Performance Dashboard")
+st.markdown("---")
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+# Sidebar para filtros
+with st.sidebar:
+    st.header("Configuración")
+    target_time = st.slider(
+        "Tiempo objetivo (ms)", 
+        min_value=50, 
+        max_value=200, 
+        value=100
+    )
+    st.info("Actualización automática cada 5 minutos")
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+# Cargar datos
+with st.spinner('Cargando datos...'):
+    df = get_data()
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
+if df.empty:
+    st.warning("No se pudieron cargar los datos. Por favor verifica la conexión con Firebase.")
+else:
+    # Métricas principales
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric(
+            "Tiempo Promedio", 
+            f"{df['render_time'].mean():.2f}ms",
+            delta=f"{df['render_time'].mean() - target_time:.1f}ms"
+        )
+    
+    with col2:
+        st.metric(
+            "Tiempo Máximo",
+            f"{df['render_time'].max():.2f}ms"
+        )
+    
+    with col3:
+        over_target = (df['render_time'] > target_time).mean() * 100
+        st.metric(
+            "% Sobre Objetivo",
+            f"{over_target:.1f}%"
+        )
+    
+    with col4:
+        st.metric(
+            "Total Mediciones",
+            len(df)
+        )
+
+    # Gráfico principal
+    st.subheader("Análisis de Tiempos de Renderizado")
+    
+    fig = go.Figure()
+    fig.add_scatter(
+        x=list(range(len(df))),
+        y=df['render_time'],
+        mode='markers',
+        name='Tiempos individuales'
+    )
+    fig.add_hline(
+        y=df['render_time'].mean(),
+        line_dash="dash",
+        annotation_text=f"Promedio: {df['render_time'].mean():.2f}ms"
+    )
+    fig.add_hline(
+        y=target_time,
+        line_dash="dash",
+        line_color="red",
+        annotation_text=f"Objetivo: {target_time}ms"
+    )
+    fig.update_layout(
+        title="Tiempos de Renderizado QR",
+        xaxis_title="Medición",
+        yaxis_title="Tiempo (ms)"
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Análisis detallado
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Distribución de Rendimiento")
+        performance_categories = pd.cut(
+            df['render_time'],
+            bins=[0, 50, 75, target_time, float('inf')],
+            labels=['Excelente', 'Bueno', 'Aceptable', 'Insatisfactorio']
+        )
+        fig_pie = px.pie(
+            values=performance_categories.value_counts(),
+            names=performance_categories.value_counts().index,
+            color_discrete_sequence=px.colors.qualitative.Set3
+        )
+        st.plotly_chart(fig_pie)
+
+    with col2:
+        st.subheader("Estadísticas Detalladas")
+        stats_df = df['render_time'].describe().round(2)
+        st.dataframe(stats_df, use_container_width=True)
+
+    # Tabla de datos
+    st.subheader("Datos Detallados")
+    st.dataframe(
+        df.sort_values('render_time', ascending=False),
+        use_container_width=True
     )
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
-
-    return gdp_df
-
-gdp_df = get_gdp_data()
-
-# -----------------------------------------------------------------------------
-# Draw the actual page
-
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
-
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+# Botón de actualización manual
+if st.button("Actualizar Datos"):
+    st.cache_data.clear()
+    st.experimental_rerun()
