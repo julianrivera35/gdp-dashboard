@@ -4,7 +4,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import firebase_admin
 from firebase_admin import credentials, firestore
-from datetime import datetime
+from datetime import datetime, timezone
+import pytz
 
 # Page configuration
 tabs = st.tabs(["Sprint 3", "Sprint 4"])
@@ -259,16 +260,23 @@ with tabs[1]:
                 
             lang_ref = db.collection('AnalyticsBusinessQuestions/sprint4/businessQuestion5')
             docs = lang_ref.stream()
+
+            colombia_tz = pytz.timezone('America/Bogota')
             
             data = []
             for doc in docs:
                 doc_data = doc.to_dict()
+                timestamp = doc_data.get('timestamp')
+                if timestamp:
+                     # Convert to Colombia timezone
+                    timestamp = timestamp.astimezone(colombia_tz)
+           
                 data.append({
                     'user_id': doc_data.get('userId', 'unknown'),
                     'language': doc_data.get('lan', 'unknown'),
-                    'timestamp': doc_data.get('timestamp', datetime.now())
-                })
-            
+                    'timestamp': timestamp
+           })
+       
             return pd.DataFrame(data)
         except Exception as e:
             st.error(f"Error fetching language data: {str(e)}")
@@ -277,11 +285,27 @@ with tabs[1]:
     # Load data
     with st.spinner('Loading language data...'):
         lang_df = get_language_data()
+
+    @st.cache_data(ttl=300)
+    def get_user_count():
+        try:
+            db = init_firebase()
+            if db is None:
+                return 0
+           
+            users_ref = db.collection('users')
+            total = len(list(users_ref.stream()))
+            return total
+        except Exception as e:
+            st.error(f"Error fetching users: {str(e)}")
+            return 0
+
+    # Update metrics display
     
     if not lang_df.empty:
         # Key metrics
-        total_users = len(lang_df['user_id'].unique())
-        lang_users = len(lang_df['user_id'].unique()) - len(lang_df.groupby('user_id').filter(lambda x: len(x) == 1)['user_id'].unique())
+        total_users = get_user_count()
+        lang_users = len(lang_df['user_id'].unique())
         
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -323,3 +347,7 @@ with tabs[1]:
         }).round(2)
         user_changes.columns = ['Total Changes', 'First Change', 'Last Change']
         st.dataframe(user_changes.sort_values('Total Changes', ascending=False))
+    
+    if st.button("Refresh Data Sprint 4"):
+        st.cache_data.clear()
+        st.rerun()
